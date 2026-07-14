@@ -44,6 +44,29 @@ function formatBytes(bytes: number, decimals = 2) {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + " " + sizes[i];
 }
 
+// Utility to find common prefix directory from a list of relative paths inside a ZIP file
+function findCommonDirectoryPrefix(paths: string[]): string {
+  if (paths.length === 0) return "";
+  const splitPaths = paths.map((p) => p.split("/"));
+  // Find the minimum directory segments length (ignoring the file name itself, which is the last element)
+  const minDirLength = Math.min(...splitPaths.map((sp) => sp.length - 1));
+  if (minDirLength <= 0) return "";
+
+  const commonSegments: string[] = [];
+  for (let i = 0; i < minDirLength; i++) {
+    const segment = splitPaths[0][i];
+    const allMatch = splitPaths.every((sp) => sp[i] === segment);
+    if (allMatch) {
+      commonSegments.push(segment);
+    } else {
+      break;
+    }
+  }
+
+  if (commonSegments.length === 0) return "";
+  return commonSegments.join("/") + "/";
+}
+
 export default function FileBrowser({ files, onFilesChange }: FileBrowserProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
@@ -54,6 +77,7 @@ export default function FileBrowser({ files, onFilesChange }: FileBrowserProps) 
   const [showNewFileForm, setShowNewFileForm] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [autoStripPrefix, setAutoStripPrefix] = useState(true);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -96,31 +120,45 @@ export default function FileBrowser({ files, onFilesChange }: FileBrowserProps) 
       if (file.name.endsWith(".zip") || file.type === "application/zip" || file.type === "application/x-zip-compressed") {
         try {
           const zip = await JSZip.loadAsync(file);
+          
+          // First pass: collect all non-directory paths from the ZIP to analyze prefixes
+          const zipEntries: Array<{ relativePath: string; zipEntry: any }> = [];
           for (const [relativePath, zipEntry] of Object.entries(zip.files)) {
             if (!zipEntry.dir) {
-              const isBinary = isFileBinary(relativePath);
-              let content = "";
-              if (isBinary) {
-                content = await zipEntry.async("base64");
-              } else {
-                content = await zipEntry.async("string");
-              }
+              zipEntries.push({ relativePath, zipEntry });
+            }
+          }
 
-              // Check if file already exists in our transfer list
-              const existingIndex = updatedFiles.findIndex((f) => f.path === relativePath);
-              const stagedFile: StagedFile = {
-                path: relativePath,
-                content,
-                isBinary,
-                size: (zipEntry as any)._data?.uncompressedSize || content.length,
-                staged: true,
-              };
+          const extractedPaths = zipEntries.map((e) => e.relativePath);
+          const commonPrefix = autoStripPrefix ? findCommonDirectoryPrefix(extractedPaths) : "";
 
-              if (existingIndex > -1) {
-                updatedFiles[existingIndex] = stagedFile;
-              } else {
-                updatedFiles.push(stagedFile);
-              }
+          // Second pass: process and load all collected files, optionally stripping common prefix
+          for (const { relativePath, zipEntry } of zipEntries) {
+            const isBinary = isFileBinary(relativePath);
+            let content = "";
+            if (isBinary) {
+              content = await zipEntry.async("base64");
+            } else {
+              content = await zipEntry.async("string");
+            }
+
+            // Strip the common wrapping folder prefix so the project files sit at root level
+            const cleanedPath = commonPrefix ? relativePath.substring(commonPrefix.length) : relativePath;
+
+            // Check if file already exists in our transfer list
+            const existingIndex = updatedFiles.findIndex((f) => f.path === cleanedPath);
+            const stagedFile: StagedFile = {
+              path: cleanedPath,
+              content,
+              isBinary,
+              size: (zipEntry as any)._data?.uncompressedSize || content.length,
+              staged: true,
+            };
+
+            if (existingIndex > -1) {
+              updatedFiles[existingIndex] = stagedFile;
+            } else {
+              updatedFiles.push(stagedFile);
             }
           }
         } catch (err: any) {
@@ -355,7 +393,7 @@ export default function FileBrowser({ files, onFilesChange }: FileBrowserProps) 
           onDragLeave={handleDrag}
           onDrop={handleDrop}
           onClick={() => fileInputRef.current?.click()}
-          className={`flex flex-col items-center justify-center p-5 border-2 border-dashed rounded-lg text-center cursor-pointer mb-4 transition-all duration-200 ${
+          className={`flex flex-col items-center justify-center p-5 border-2 border-dashed rounded-lg text-center cursor-pointer mb-3 transition-all duration-200 ${
             dragActive
               ? "border-blue-500 bg-blue-950/20 text-blue-300"
               : "border-slate-800 hover:border-slate-700 bg-slate-950/40 hover:bg-slate-950/70 text-slate-400"
@@ -376,6 +414,23 @@ export default function FileBrowser({ files, onFilesChange }: FileBrowserProps) 
           <p className="text-[10px] text-slate-500 mt-1 leading-normal">
             Supports folders/ZIP archives (auto-extracts) or separate files.
           </p>
+        </div>
+
+        {/* Auto Strip ZIP Wrapper Directory Toggle */}
+        <div className="flex items-start gap-2.5 px-2 py-2 bg-slate-950/50 border border-slate-850 rounded-lg mb-4 select-none">
+          <input
+            type="checkbox"
+            id="auto-strip-prefix-checkbox"
+            checked={autoStripPrefix}
+            onChange={(e) => setAutoStripPrefix(e.target.checked)}
+            className="rounded border-slate-800 bg-slate-950 text-blue-500 focus:ring-blue-500 h-4 w-4 cursor-pointer accent-blue-500 mt-0.5"
+          />
+          <label htmlFor="auto-strip-prefix-checkbox" className="text-xs font-medium text-slate-300 cursor-pointer hover:text-slate-200 leading-tight">
+            Auto-strip common ZIP root folder
+            <span className="text-[10px] text-slate-500 font-mono block mt-1 leading-normal">
+              Extracts and maps files (such as <code className="text-blue-400">gradlew</code> or <code className="text-blue-400">android/</code> directories) directly to the repository root. This ensures GitHub Actions workflows compile correctly without nested folder mismatch!
+            </span>
+          </label>
         </div>
 
         {/* New File Form */}
