@@ -1,0 +1,6 @@
+{
+  "name": "GitHub File Transfer & ZIP Extractor",
+  "description": "Upload files or extract ZIP archives, inspect and edit their contents, then stage and commit them directly to your GitHub repositories using OAuth or personal access tokens.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
