@@ -80,6 +80,7 @@ export default function FileBrowser({ files, onFilesChange }: FileBrowserProps) 
   const [autoStripPrefix, setAutoStripPrefix] = useState(true);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
 
   const selectedFile = files.find((f) => f.path === selectedFilePath);
 
@@ -107,65 +108,50 @@ export default function FileBrowser({ files, onFilesChange }: FileBrowserProps) 
     });
   };
 
-  // Handle incoming Files (either via file selector or drag & drop)
+  // Handle incoming Files (either via file selector, folder selector, or drag & drop)
   const processFiles = async (fileList: FileList | null) => {
     if (!fileList) return;
     setErrorMsg(null);
     const updatedFiles = [...files];
 
+    // Intermediate list to accumulate files to add/overwrite
+    const newFilesToInsert: Array<{
+      originalPath: string;
+      content: string;
+      isBinary: boolean;
+      size: number;
+    }> = [];
+
     for (let i = 0; i < fileList.length; i++) {
-      const file = fileList[i];
+      const file = fileList[i] as any; // Cast as any to access webkitRelativePath safely
 
       // If file is a ZIP, extract it!
       if (file.name.endsWith(".zip") || file.type === "application/zip" || file.type === "application/x-zip-compressed") {
         try {
           const zip = await JSZip.loadAsync(file);
-          
-          // First pass: collect all non-directory paths from the ZIP to analyze prefixes
-          const zipEntries: Array<{ relativePath: string; zipEntry: any }> = [];
           for (const [relativePath, zipEntry] of Object.entries(zip.files)) {
             if (!zipEntry.dir) {
-              zipEntries.push({ relativePath, zipEntry });
-            }
-          }
+              const isBinary = isFileBinary(relativePath);
+              let content = "";
+              if (isBinary) {
+                content = await zipEntry.async("base64");
+              } else {
+                content = await zipEntry.async("string");
+              }
 
-          const extractedPaths = zipEntries.map((e) => e.relativePath);
-          const commonPrefix = autoStripPrefix ? findCommonDirectoryPrefix(extractedPaths) : "";
-
-          // Second pass: process and load all collected files, optionally stripping common prefix
-          for (const { relativePath, zipEntry } of zipEntries) {
-            const isBinary = isFileBinary(relativePath);
-            let content = "";
-            if (isBinary) {
-              content = await zipEntry.async("base64");
-            } else {
-              content = await zipEntry.async("string");
-            }
-
-            // Strip the common wrapping folder prefix so the project files sit at root level
-            const cleanedPath = commonPrefix ? relativePath.substring(commonPrefix.length) : relativePath;
-
-            // Check if file already exists in our transfer list
-            const existingIndex = updatedFiles.findIndex((f) => f.path === cleanedPath);
-            const stagedFile: StagedFile = {
-              path: cleanedPath,
-              content,
-              isBinary,
-              size: (zipEntry as any)._data?.uncompressedSize || content.length,
-              staged: true,
-            };
-
-            if (existingIndex > -1) {
-              updatedFiles[existingIndex] = stagedFile;
-            } else {
-              updatedFiles.push(stagedFile);
+              newFilesToInsert.push({
+                originalPath: relativePath,
+                content,
+                isBinary,
+                size: (zipEntry as any)._data?.uncompressedSize || content.length,
+              });
             }
           }
         } catch (err: any) {
           setErrorMsg(`Failed to extract zip file "${file.name}": ${err.message}`);
         }
       } else {
-        // Individual standard file
+        // Individual standard file or file from a folder upload
         try {
           const isBinary = isFileBinary(file.name);
           let content = "";
@@ -175,24 +161,44 @@ export default function FileBrowser({ files, onFilesChange }: FileBrowserProps) 
             content = await readFileAsText(file);
           }
 
-          const relativePath = file.name;
-          const existingIndex = updatedFiles.findIndex((f) => f.path === relativePath);
-          const stagedFile: StagedFile = {
-            path: relativePath,
+          // If uploaded via folder selection, webkitRelativePath will have the path
+          const relativePath = file.webkitRelativePath || file.name;
+
+          newFilesToInsert.push({
+            originalPath: relativePath,
             content,
             isBinary,
             size: file.size,
-            staged: true,
-          };
-
-          if (existingIndex > -1) {
-            updatedFiles[existingIndex] = stagedFile;
-          } else {
-            updatedFiles.push(stagedFile);
-          }
+          });
         } catch (err: any) {
           setErrorMsg(`Failed to read file "${file.name}": ${err.message}`);
         }
+      }
+    }
+
+    // Find common directory prefix among newly processed files
+    const paths = newFilesToInsert.map((f) => f.originalPath);
+    const commonPrefix = autoStripPrefix ? findCommonDirectoryPrefix(paths) : "";
+
+    for (const fileToInsert of newFilesToInsert) {
+      const cleanedPath = (commonPrefix && fileToInsert.originalPath.startsWith(commonPrefix))
+        ? fileToInsert.originalPath.substring(commonPrefix.length)
+        : fileToInsert.originalPath;
+
+      // Check if file already exists in our transfer list
+      const existingIndex = updatedFiles.findIndex((f) => f.path === cleanedPath);
+      const stagedFile: StagedFile = {
+        path: cleanedPath,
+        content: fileToInsert.content,
+        isBinary: fileToInsert.isBinary,
+        size: fileToInsert.size,
+        staged: true,
+      };
+
+      if (existingIndex > -1) {
+        updatedFiles[existingIndex] = stagedFile;
+      } else {
+        updatedFiles.push(stagedFile);
       }
     }
 
@@ -223,6 +229,12 @@ export default function FileBrowser({ files, onFilesChange }: FileBrowserProps) 
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      processFiles(e.target.files);
+    }
+  };
+
+  const handleFolderChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       processFiles(e.target.files);
     }
@@ -407,16 +419,46 @@ export default function FileBrowser({ files, onFilesChange }: FileBrowserProps) 
             className="hidden"
             accept=".zip,image/*,text/*,application/javascript,application/json,application/x-typescript"
           />
+          <input
+            type="file"
+            ref={folderInputRef}
+            onChange={handleFolderChange}
+            {...{ webkitdirectory: "", directory: "" }}
+            multiple
+            className="hidden"
+          />
           <Upload className={`w-8 h-8 mb-2 transition-transform duration-200 ${dragActive ? "scale-110 text-blue-400" : "text-slate-500"}`} />
-          <p className="text-xs font-semibold text-slate-300">
-            Click to upload files / zip, or drag & drop here
+          <p className="text-xs font-semibold text-slate-300 mb-2">
+            Drag & Drop Files, ZIPs, or Folders here
           </p>
+          <div className="flex gap-2 mb-1.5">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                fileInputRef.current?.click();
+              }}
+              className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded text-xs font-semibold shadow transition-colors cursor-pointer animate-fadeIn"
+            >
+              Upload Files / ZIP
+            </button>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                folderInputRef.current?.click();
+              }}
+              className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded border border-slate-700 text-xs font-semibold shadow transition-colors cursor-pointer animate-fadeIn"
+            >
+              Upload Folder
+            </button>
+          </div>
           <p className="text-[10px] text-slate-500 mt-1 leading-normal">
-            Supports folders/ZIP archives (auto-extracts) or separate files.
+            Extracts ZIPs & preserves folder directory structure on upload.
           </p>
         </div>
 
-        {/* Auto Strip ZIP Wrapper Directory Toggle */}
+        {/* Auto Strip Common Root Directory Toggle */}
         <div className="flex items-start gap-2.5 px-2 py-2 bg-slate-950/50 border border-slate-850 rounded-lg mb-4 select-none">
           <input
             type="checkbox"
@@ -426,9 +468,9 @@ export default function FileBrowser({ files, onFilesChange }: FileBrowserProps) 
             className="rounded border-slate-800 bg-slate-950 text-blue-500 focus:ring-blue-500 h-4 w-4 cursor-pointer accent-blue-500 mt-0.5"
           />
           <label htmlFor="auto-strip-prefix-checkbox" className="text-xs font-medium text-slate-300 cursor-pointer hover:text-slate-200 leading-tight">
-            Auto-strip common ZIP root folder
+            Auto-strip common wrapping root folder
             <span className="text-[10px] text-slate-500 font-mono block mt-1 leading-normal">
-              Extracts and maps files (such as <code className="text-blue-400">gradlew</code> or <code className="text-blue-400">android/</code> directories) directly to the repository root. This ensures GitHub Actions workflows compile correctly without nested folder mismatch!
+              Strips the common top-level directory prefix from extracted ZIP items or uploaded folders (e.g. mapping <code className="text-blue-400">MyProject/gradlew</code> directly to <code className="text-blue-400">gradlew</code> at root). This ensures workspace files compile seamlessly.
             </span>
           </label>
         </div>
