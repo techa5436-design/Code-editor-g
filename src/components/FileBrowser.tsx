@@ -67,6 +67,60 @@ function findCommonDirectoryPrefix(paths: string[]): string {
   return commonSegments.join("/") + "/";
 }
 
+// Utility to recursively traverse dropped directories
+function traverseFileTree(entry: any, path: string = ""): Promise<File[]> {
+  return new Promise((resolve) => {
+    if (entry.isFile) {
+      entry.file(
+        (file: File) => {
+          const fullPath = path + file.name;
+          try {
+            Object.defineProperty(file, "webkitRelativePath", {
+              value: fullPath,
+              writable: true,
+              configurable: true,
+            });
+          } catch (e) {
+            (file as any).customRelativePath = fullPath;
+          }
+          resolve([file]);
+        },
+        () => resolve([])
+      );
+    } else if (entry.isDirectory) {
+      const dirReader = entry.createReader();
+      const readAllEntries = (): Promise<any[]> => {
+        return new Promise((resolveEntries) => {
+          const allEntries: any[] = [];
+          const readEntries = () => {
+            dirReader.readEntries(
+              (entries: any[]) => {
+                if (entries.length === 0) {
+                  resolveEntries(allEntries);
+                } else {
+                  allEntries.push(...entries);
+                  readEntries();
+                }
+              },
+              () => resolveEntries(allEntries)
+            );
+          };
+          readEntries();
+        });
+      };
+
+      readAllEntries().then((entries) => {
+        const promises = entries.map((e) => traverseFileTree(e, path + entry.name + "/"));
+        Promise.all(promises).then((fileArrays) => {
+          resolve(fileArrays.flat());
+        });
+      });
+    } else {
+      resolve([]);
+    }
+  });
+}
+
 export default function FileBrowser({ files, onFilesChange }: FileBrowserProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
@@ -109,7 +163,7 @@ export default function FileBrowser({ files, onFilesChange }: FileBrowserProps) 
   };
 
   // Handle incoming Files (either via file selector, folder selector, or drag & drop)
-  const processFiles = async (fileList: FileList | null) => {
+  const processFiles = async (fileList: FileList | File[] | null) => {
     if (!fileList) return;
     setErrorMsg(null);
     const updatedFiles = [...files];
@@ -122,8 +176,10 @@ export default function FileBrowser({ files, onFilesChange }: FileBrowserProps) 
       size: number;
     }> = [];
 
-    for (let i = 0; i < fileList.length; i++) {
-      const file = fileList[i] as any; // Cast as any to access webkitRelativePath safely
+    const fileArray = Array.isArray(fileList) ? fileList : Array.from(fileList);
+
+    for (let i = 0; i < fileArray.length; i++) {
+      const file = fileArray[i] as any; // Cast as any to access webkitRelativePath safely
 
       // If file is a ZIP, extract it!
       if (file.name.endsWith(".zip") || file.type === "application/zip" || file.type === "application/x-zip-compressed") {
@@ -161,8 +217,8 @@ export default function FileBrowser({ files, onFilesChange }: FileBrowserProps) 
             content = await readFileAsText(file);
           }
 
-          // If uploaded via folder selection, webkitRelativePath will have the path
-          const relativePath = file.webkitRelativePath || file.name;
+          // If uploaded via folder selection or drag/drop, custom/webkitRelativePath will have the path
+          const relativePath = file.customRelativePath || file.webkitRelativePath || file.name;
 
           newFilesToInsert.push({
             originalPath: relativePath,
@@ -223,7 +279,38 @@ export default function FileBrowser({ files, onFilesChange }: FileBrowserProps) 
     e.preventDefault();
     e.stopPropagation();
     setDragActive(false);
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+
+    if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
+      const filesToProcess: File[] = [];
+      const entryPromises: Promise<File[]>[] = [];
+
+      for (let i = 0; i < e.dataTransfer.items.length; i++) {
+        const item = e.dataTransfer.items[i];
+        if (item.kind === "file") {
+          const entry = item.webkitGetAsEntry();
+          if (entry) {
+            entryPromises.push(traverseFileTree(entry, ""));
+          } else {
+            const file = item.getAsFile();
+            if (file) filesToProcess.push(file);
+          }
+        }
+      }
+
+      if (entryPromises.length > 0) {
+        try {
+          const results = await Promise.all(entryPromises);
+          const traversedFiles = results.flat();
+          filesToProcess.push(...traversedFiles);
+        } catch (err: any) {
+          setErrorMsg(`Failed to process dropped folder items: ${err.message}`);
+        }
+      }
+
+      if (filesToProcess.length > 0) {
+        await processFiles(filesToProcess);
+      }
+    } else if (e.dataTransfer.files && e.dataTransfer.files[0]) {
       await processFiles(e.dataTransfer.files);
     }
   };
